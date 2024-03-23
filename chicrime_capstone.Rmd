@@ -1,0 +1,517 @@
+---
+title: 'Chicago Crimes: Predicting Crime in the Third Largest U.S. City'
+author: "Christopher Craig"
+date: "2024-03-15"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# **Executive Summary**
+
+Chicago, IL is the third largest city in the United States in terms of population, only trailing New York and Los Angeles. When many Americans think of Chicago, they also think of crime as this is the topic most heavily dominated in the news cycles when covering Chicago. The amount of crime is a talking point with politicians, an often called upon theme when comparing to other cities of similar size.
+
+For this analysis, I wanted to look at a hypothetical situation of a newly elected mayor who wants to predict the amount of crime the city will experience in order to properly allocate resources and set expectations for his/her term. The mayor has worked with criminologists and knows that cities generally experience more crime in the summer months when the weather is warmer and less crime when it's cold [^1]. Knowing this, the mayor hypothesizes they can use historical Chicago weather data and other factors such as where the crime was committed as well as what kind of crime was committed in order to predict the number of crimes the city will experience.
+
+[^1]: <https://crimesciencejournal.biomedcentral.com/articles/10.1186/s40163-022-00179-8>
+
+This analysis will call upon two distinct data sets, both pulled from the Kaggle repository. The first data set has historical reported crime in Chicago, with observations such as what kind of crime was reported, when it was reported, where it was reported and if an arrest was made. This data set excludes murders and was initially extracted from the Chicago Police Department's CLEAR (citizen Law Enforcement Analysis and Reporting) system[^2].
+
+[^2]: <https://www.kaggle.com/datasets/adelanseur/crimes-2001-to-present-chicago>
+
+The second data set has historical weather information for Chicago, such as recorded temperature, humidity, wind speed, atmospheric pressure and date and time of the observations. Since date is the unique identifier in both data sets, I was able to merge the two data sets in order to formulate a prediction using two methods: 1) The root mean squared error (RMSE) and 2) Random Forests . I prefer the RMSE model as we can closely interpret this to the standard deviation in our prediction and we have a clear goal while running the model: to decrease the RMSE as much as possible. The model starts with the average amount of crime, then I will add the effects of the month, type of crime, district the crime occurred, as well as the average temperature of the month the crime occurred. 
+
+```{r RMSE Formula, echo = FALSE}
+
+knitr::include_graphics("RMSE_Formula.jpg")
+
+```
+I also wanted to see if the regression improves with Random Forests as this model averages multiple decision trees, each tree being randomly different which should reduce instability and improve our model. This will give our hypothetical mayor options and show how well the models perform against one another. 
+
+First, I will explore both data sets prior to making the prediction using the RMSE and Random Forest algorithms.
+
+```{r - package load, echo = FALSE, include = FALSE}
+
+####Dataset packages and file downloads. ######
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(readr)) install.packages("readr", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("kntr", repos = "http://cran.us.r-project.org")
+if(!require(scales)) install.packages("scales", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubdridate", repos = "http://cran.us.r-project.org")
+if(!require(randomForest)) install.packages("randomForest", repos = "http://cran.us.r-project.org")
+
+library(tidyverse)
+library(caret)
+library(readr)
+library(knitr)
+library(scales)
+library(lubridate)
+library(randomForest)
+
+options(timeout = 120)
+  
+##Chicago Crimes and Chicago Weather data set download. May take a couple minutes to download####
+
+url <- "https://github.com/ccraig88/capstone-chicrime/archive/refs/heads/main.zip"
+temp <- tempfile()
+download.file(url,temp)
+unzip(temp, "capstone-chicrime-main/chicago_crimes_v2.csv")
+
+data <- read.csv("capstone-chicrime-main/chicago_crimes_v2.csv", header = TRUE, sep = ",")
+
+unlink(temp)
+
+temp2 <- tempfile()
+download.file(url,temp2)
+unzip(temp2, "capstone-chicrime-main/chiweather.csv")
+weather <- read.csv("capstone-chicrime-main/chiweather.csv", header = TRUE, sep = ",")
+
+unlink(temp)
+
+set.seed(1, sample.kind="Rounding") # if using R 3.6 or later
+# set.seed(1) # if using R 3.5 or earlier
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# **Exploratory Analysis of the Chicago Crime Dataset**
+
+Let's first analyze the Chicago Crimes dataset. An important reminder: This data set reflects reported incidents of crime that occurred in the city of Chicago but excludes murders.
+
+First, let's look at the structure of the Chicago Crimes data set:
+
+```{r Chicago Crimes Structure, echo = FALSE}
+
+## Reviewing the structure of the Chicago Crimes data set in order to see what variables exist at a high level ##
+str(data)
+
+```
+
+We see we have some key fields to work with, including the date, type of crime observed (Primary.Type), and District. The date will be important because further on in our analysis, I will delineate the data by month as our hypothetical mayor would like to predict the amount of crime on a monthly basis.
+
+Next, let's take a high level look at the trend of crimes reported over time.
+
+```{r Crime Time Series Plot, echo = FALSE}
+
+## This will produce a line chart showing the total number of crimes reported by date ##
+
+data %>% mutate(new_date = as.Date(new_date), month_year = format(as.Date(new_date), "%Y-%m")) %>% 
+  group_by(new_date) %>% summarize(n = n())  %>%
+  ggplot(aes(new_date,n)) + geom_line(color = "blue") + theme(axis.text.x = element_text(angle = 90)) + scale_x_date() + 
+  ggtitle("Reported Crimes in Chicago") + labs(x = "Date", y = "Count")
+
+
+```
+
+We notice a few things here. First, our hypothesis appears to be directionally correct: we see the number of reported crimes trend upwards in the summer months and trend downward around January of each year. We also see our data starts in 2021 and goes into 2023 so we have a good amount of observations to work with.
+
+Due to the fact that 2023 only includes partial data for the year, we will remove this year to get a clean 2021 - 2022 data set. After doing so, let's see the total number of crimes per month
+
+```{r Remove 2023 from Chicago Crimes Dataset and plot total number of crimes per month, echo = FALSE}
+
+### Remove 2023 from the data, group by month and plot total number of crimes reported by month ##
+
+data <- data %>% filter(Year != 2023)
+
+data %>% mutate(new_date = as.Date(new_date)) %>% mutate(month = month(new_date, label = TRUE)) %>% group_by(month) %>% summarize(total = n()) %>% ggplot(aes(month, total)) + geom_line(group = 1) + 
+  ggtitle("Reported Crimes in Chicago by Month: 2021 - 2022") + labs(x = "Month", y = "Count")
+
+```
+
+We see something interesting here. The number of of crimes reported over this two year period is higher in May through Sep but we also see that October is the month with the highest total number of crimes reported in this data set. However, after October we see the anticipated decline into November. February is the month in this data set with the lowest total number of reported crimes.
+
+Next, let's look at a histogram of the total number of reported crimes.
+
+```{r Crimes Reported Histogram, echo = FALSE}
+
+## This will produce a histogram of the total number of crimes reported in the Chicago Crimes Dataset ##
+
+data %>% group_by(new_date) %>% summarize(n = n()) %>% ggplot(aes(n)) + geom_histogram(bins = 20)+ 
+  ggtitle("Reported Crimes by Day Histogram: 2021 - 2022") + labs(x = "Total Number of Crimes per Day")
+
+
+```
+
+We see a normal distribution with approximately 600 crimes reported per day most often seen in the data set. That is certainly a lot of reported crime!
+
+Next let's take a look at what kinds of crime are being reported in the data set and if there's any crime that gets reported on more than others.
+
+```{r Bar Chart showing Types of Crime in Chicago Crimes dataset, echo = FALSE}
+
+## This will produce a horizontal bar chart showing the types of crime in descending order by most reported ##
+
+data %>% group_by(Primary.Type) %>% summarize(n = n())  %>% 
+  ggplot(aes(x= reorder(Primary.Type,+n),n)) + geom_bar(stat = "identity") + coord_flip() + 
+  labs(x = "Crime Primary Type", y = "Count") + ggtitle("Chicago Crimes: 2021 - 2022") + 
+  scale_y_continuous(labels = label_comma())
+
+```
+
+This graph clearly shows certain types of crime are reported more often than others with Theft, Battery, Criminal Damage, and Assault reported the most.
+
+Now, let's see if there are districts within Chicago where crime is reported more than others.
+
+```{r - Bar Chart showing crimes reported by District, echo = FALSE}
+
+## This bar chart will show the amount of crime reports by district, sorted in descending order ##
+
+data %>% group_by(District) %>% summarize(n = n()) %>% arrange(desc(n)) %>% 
+  ggplot(aes(x = reorder(as.character(District),+n),n)) + geom_bar(stat = "identity")+ 
+  ggtitle("Reported Crimes by Chicago District: 2021 - 2022") + labs(x = "District", y = "Count")
+
+```
+
+This graph clearly shows us that certain districts have more reported crime than others. Districts 4, 6, 8, 11, 12 each reported over 25,000 crimes in this two year period.
+
+We now know some key pieces from the Chicago Crimes data set that will help us in our prediction: we know the amount of crimes reported varies by district, the types of crime varies, and the amount of crime reported will vary by month (typically colder months report less crime).
+
+Next, let's look at the Chicago weather data set and merge with the Chicago Crimes data set.
+
+# **Exploratory Analysis of the Chicago Weather Dataset & Merging with the Crimes Dataset**
+
+Let's first look at the structure of the weather data set:
+
+```{r Weather Structure, echo = FALSE}
+
+## This will add a date attribute and look at the structure of the weather dataset ##
+
+weather <- weather %>% unite(date, c(YEAR,MO,DY), sep = "-", remove = FALSE) %>% 
+  mutate(date = as.Date(date))
+
+str(weather)
+
+
+
+```
+
+There are some key pieces of data we can utilize: from the Year, Mo, and Dy attributes we formulated a date that we can then use to join with our crimes data set. While we will solely be using the TEMP (temperature) variable, we see we also have observations on the amount of precipitation (PRCP), humidity (HMDT), wind speed (WND_SPD) and atmospheric pressure (ATM_PRESS).
+
+Let's look at temperatures by day in Chicago
+
+```{r Chicago Temperature Time Series Analysis, echo = FALSE}
+
+## Shows Time Series line graph showing Temps in Chicago ##
+
+weather %>% ggplot(aes(date, TEMP)) + geom_line()+ theme(axis.text.x = element_text(angle = 90)) + scale_x_date() + 
+  ggtitle("Chicago Temperatures") + labs(x = "Date", y = "Temperature (in Celsius)")
+
+
+```
+
+This chart isn't overly insightful, we see temperatures get higher in summer months and lower in winter months. The range is 30 to -20 Celsius and we see this data goes from 2021 to 2024 which is good because there is overlap between this and the observation dates in the crimes data set.
+
+Using this data set we can look a a histogram of temperatures:
+
+```{r Chicago Temperatures Histogram, echo = FALSE}
+
+## This will show a histogram of Chicago temps ##
+
+weather %>% ggplot(aes(TEMP)) + geom_histogram(bins = 50) + 
+  ggtitle("Chicago Temperatures Histogram") + labs(x = "Temperature (in Celsius)")
+
+```
+
+This histogram shows we have a bi-modal distribution, with peaks around 2 and 24 degrees celcius.
+
+We can also view the average temperatures by month in the weather data set:
+
+```{r Average temps by Month, echo = FALSE}
+
+## This bar chart shows the average temperatures by month in the weather data set ##
+
+weather %>% mutate(month = month(date, label = TRUE)) %>% group_by(month) %>% summarize(avg_temp = mean(TEMP)) %>% ggplot(aes(month, avg_temp)) + geom_bar(stat = "identity") + 
+  ggtitle("Chicago Average Temperature by Month") + labs(x = "Month", y = "Temperature (in Celsius)")
+
+```
+
+Again, not overly insightful but good to see how the temperature widely varies in Chicago.
+
+Let's now do an initial join, by date, with the Crimes data set to see if there is a correlation between temperatures and reported crime. For this I am going to use the maximum temperature reported for a given date
+
+```{r Exploratory analysis joining temperature with crimes dataset, echo = FALSE, message = FALSE, warning= FALSE}
+
+## I am going to group both data sets by date and join on date. Then will create a scatter plot ##
+
+# This groups the weather data by date #
+weather_grouped <- weather %>% group_by(date) %>% summarize(temp_high = max(TEMP))
+
+# This groups the crimes data set by date #
+data_grouped <- data %>% group_by(new_date) %>% summarize(total = n()) %>% mutate(new_date = as.Date(new_date))
+
+# This will merge both by date and create a new table named "merged" #
+
+merged <- weather_grouped %>% rename("new_date" = date) %>% left_join(data_grouped, by = join_by(new_date))
+
+# This creates a scatter plot on the merged table. Points represent days #
+
+merged %>% mutate(month = month(new_date, label = TRUE)) %>% ggplot(aes(total,temp_high, color = month, group = 1)) + geom_point() + geom_smooth() + 
+  ggtitle("Daily High Temps x Total Crime in Chicago") + labs(x = "Total Daily Crimes", y = "Daily High Temperature (in Celsius)")
+
+```
+
+It appears from this table there is a positive correlation between daily high temps and daily total reported crimes. We can also look at the correlation coefficient between high temps and total crimes.
+
+```{r Correlation Coefficient between total Crimes and Daily High Temps, echo = FALSE}
+
+## This will show what the correlation coefficient is between Daily High Temps and Total Crime ##
+
+merged %>% filter(!is.na(total)) %>% summarize(Correlation_Coefficient = cor(total, temp_high))
+
+```
+
+We see from the correlation coefficient that there is moderate correlation between high temps and total crime. I suspect the correlation would be higher but we see in the exploratory analysis on the crimes data set that October was the month with the most crime and we know from the exploratory analysis that there are warmer months than October.
+
+Now let's join the key elements from the weather data set to the crimes data set. Since our hypothetical mayor wants to predict the number of crimes by month, I am going to group each data set by month and use that as the join.
+
+```{r Joining both datasets to perform predictions, echo = FALSE, warning = FALSE, message = FALSE}
+
+## Grouping Weather data by month and creating new table taking the average temperature, precipitation, humidity, wind speed, and atmospheric pressure ##
+
+weather_data <- weather %>% mutate(month = month(date, label = TRUE)) %>% group_by(month) %>% 
+  summarize(TEMP = mean(TEMP), PRCP = mean(PRCP), HMDT = mean(HMDT), 
+            WND_SPD = mean(WND_SPD), ATM_PRESS = mean(ATM_PRESS))
+
+## Grouping the crimes dataset and joining with the grouped weather dataset
+
+compiled <- data %>% mutate(new_date = as.Date(new_date)) %>% mutate(month = month(new_date, label = TRUE)) %>% 
+  group_by(month, Primary.Type, District) %>% summarize(total = n()) %>% left_join(weather_data, by = 'month') 
+
+## Preview the Compiled Data
+
+head(compiled)
+
+```
+
+# **Modeling using RMSE to predict Number of Crimes Per Month**
+
+In order to predict the number of monthly crimes, I first partitioned our compiled table into a training and test set with a 80/20 split, respectively. I chose 80/20 to prevent over fitting the on this data set. I believe this produces an optimal analysis for that crime data to be predicted. The code to do so is listed below.
+
+```{r Paritioning the data and setting up the RMSE}
+ ## This creates the RMSE function we will use for our prediction
+
+RMSE <- function(true_crime, predicted_crime) {
+  sqrt(mean((true_crime - predicted_crime)^2))
+}
+
+## This partitions the data into Test and Train Sets
+
+y <- compiled$total
+index <- createDataPartition(y, times = 1, p = 0.2, list = FALSE)
+test_set <- compiled[index, ]
+train_set <- compiled[-index, ]
+
+```
+
+The first model will assume the average. Inserting this into our algorithm, the RMSE on this simplistic approach is 117.76.
+
+```{r Model 1: Just the average}
+
+# Calculates average
+mu <- mean(train_set$total)
+
+# First Model simply takes average mu and applies to RMSE
+model1_rmse <- RMSE(test_set$total, mu)
+
+# Create a tibble with results
+model1_results <- tibble(Method = "Avg", RMSE = model1_rmse)
+model1_results
+
+```
+
+The second model will build upon this by adding the effect the month has to the prediction. As we saw in the exploratory analysis, the number of crimes varies by month. When adding this to our model, the RMSE improves slightly to 117.99.
+
+```{r Model 2: Adding Month Effect}
+ # Creates averages by month
+month_averages <- train_set %>% group_by(month) %>% summarize(b_month = mean(total - mu))
+
+# Adds monthly averages to the prediction
+prediction <- test_set %>% left_join(month_averages, by = 'month') %>% mutate(predicted = mu+ b_month) %>% pull(predicted)
+
+# Calculates RMSE
+month_rmse <- RMSE(test_set$total, prediction)
+
+# Create a tibble with results
+
+model2_results <- tibble(Method = "Month", RMSE = month_rmse)
+model2_results
+
+```
+
+The third model will add the averages by crime type. Per the exploratory analysis, some crimes are reported more often than others. When adding this to our model, the RMSE greatly improves to 61.13.
+
+```{r Model 3: Adding Type Effect}
+
+# Creates averages by crime type
+type_averages <- train_set %>% left_join(month_averages, by = 'month') %>% 
+  group_by(Primary.Type) %>% summarize(b_type = mean(total - mu - b_month))
+
+# Add crime type averages to prediction
+prediction <- test_set %>% left_join(month_averages, by = 'month') %>% 
+  left_join(type_averages, by = 'Primary.Type') %>% mutate(predicted = mu + b_month+b_type) %>%
+  pull(predicted)
+
+# Calculates RMSE
+type_rmse <- RMSE(test_set$total, prediction)
+
+# Create a tibble with results
+model3_results <- tibble(Method = "Type", RMSE = type_rmse)
+model3_results
+
+```
+
+The fourth model will add the averages by district as we saw some districts had much more crime compared to other districts around Chicago. This improves the RMSE to 56.79 after adding to our model.
+
+```{r Model 4: Adding District Effects}
+
+# Create averages by district
+district_averages <- train_set %>% left_join(month_averages, by = 'month') %>%
+  left_join(type_averages, by = 'Primary.Type') %>% group_by(District) %>% 
+  summarize(b_district = mean(total - mu - b_month - b_type))
+
+# Add district averages to prediction
+prediction <- test_set %>% left_join(month_averages, by = 'month') %>% 
+  left_join(type_averages, by = 'Primary.Type') %>% left_join(district_averages, by = 'District') %>%
+  mutate(predicted = mu + b_month + b_type + b_district)  %>% pull(predicted)
+
+# Calculates RMSE
+district_rmse <- RMSE(test_set$total, prediction)
+
+# Create a tibble with results
+model4_results <- tibble(Method = "District", RMSE = district_rmse)
+model4_results
+
+
+```
+
+The fifth and final model will add the averages by temperature to the prediction. While we know there is correlation between the month and the temperatures, this should account for some unpredictability when there are months that have relatively high crime and lower temps (e.g. October). Also, I will set the minimum predicted value to be 0 since there can't be negative reported crime. This improves the RMSE to 55.98, exceeding our target of 60.
+
+```{r Model 5: Adding temperature effect}
+
+# Creates averages by temperature
+temp_averages <- train_set %>% left_join(month_averages, by = 'month') %>% left_join(type_averages, by = 'Primary.Type') %>%
+  left_join(district_averages, by = 'District') %>% group_by(round = round(TEMP)) %>% 
+  summarize(b_temp = mean(total - mu - b_month - b_type - b_district))
+
+# Adds temperature averages to prediction
+# Also set the minimum predicted value to be 0 (there can't be negative crimes)
+prediction <- test_set %>% left_join(month_averages, by = 'month') %>% 
+  left_join(type_averages, by = 'Primary.Type') %>% left_join(district_averages, by = 'District') %>%
+  mutate(round = round(TEMP)) %>% left_join(temp_averages, by = 'round') %>% 
+  mutate(predicted = mu + b_month + b_type + b_district + b_temp) %>% 
+  mutate(predicted = ifelse(predicted < 0,0,predicted)) %>% pull(predicted)
+
+#Calculates RMSE
+temp_rmse <- RMSE(test_set$total, prediction)
+
+# Create a tibble with results
+model5_results <- tibble(Method = "Temperature", RMSE = temp_rmse)
+model5_results
+
+```
+
+To summarize how the RMSE progressed through the five models:
+
+```{r Summary table, echo = FALSE}
+
+# Creates a summary table with the 5 RMSE
+
+models <- c("1. Avg","2. + Month", "3. + Type", "4. + District", "5. + Temp")
+rmse_combined <- c(model1_rmse,month_rmse,type_rmse,district_rmse,temp_rmse)
+
+summary_table <- data.frame(models,rmse_combined)
+colnames(summary_table) <- c("Models", "RMSE")
+summary_table
+
+
+```
+
+We can visually see how well our model performs compared to actual number of crimes in the test set.
+
+```{r Overlaying the prediction with the Test Set, echo = FALSE}
+
+## Create a table "test" that shows our prediction
+
+test <- test_set %>% left_join(month_averages, by = 'month') %>% 
+  left_join(type_averages, by = 'Primary.Type') %>% left_join(district_averages, by = 'District') %>%
+  mutate(round = round(TEMP)) %>% left_join(temp_averages, by = 'round') %>% 
+  mutate(predicted = mu + b_month + b_type + b_district + b_temp) %>% 
+  mutate(predicted = ifelse(predicted < 0,0,predicted))
+
+## Join table "test" with test set
+
+test %>% group_by(month) %>% summarize(actual = sum(total), predicted = sum(predicted)) %>% 
+  ggplot(aes(x = month)) + geom_line(aes(y=actual, group = 1), color = "blue") + 
+  geom_line(aes(y = predicted, group = 1), color = "red", linetype = "dashed") + 
+  ggtitle("Predicted Crimes (Red) vs Actual Crimes (Blue)") + labs(x = "Month", y = "Total Number of Crimes")
+```
+
+# **Modeling using Random Forest to predict Number of Crimes Per Month**
+
+I believe an RMSE of around 56 to be very good in this case, implying the average error off by 56 crimes per month, per crime type, per district. However, let's see if Random Forests can improve upon this. 
+
+First let's fit the Random Forest model on the training set and plot the results. 
+
+```{r Random Forest fit and plot, echo = FALSE}
+
+set.seed(1)
+
+# Fit Random Forest
+fit <- randomForest(total~ month+Primary.Type+District+TEMP, data = train_set)
+
+#Plot Random Forest
+plot(fit)
+
+```
+This shows us the accuracy stabilizes around 200 decision trees. Now let's apply the prediction to the test set and create a new graph to see how it compares to the actual crimes reported by month. 
+
+```{r Applying prediction to test set and visualizing predictions vs actual crimes, echo = FALSE}
+
+# Apply Random Forest to Test Set
+
+prediction <- predict(fit, newdata = test_set)
+
+#Applying Prediction to Test_set and Plotting
+
+test_set %>% ungroup() %>% mutate(y_hat = prediction) %>% group_by(month) %>% summarize(actual = sum(total), predicted = sum(y_hat)) %>% 
+  ggplot(aes(x = month)) + geom_line(aes(y=actual, group = 1), color = "blue") + 
+  geom_line(aes(y = predicted, group = 1), color = "red", linetype = "dashed") + 
+  ggtitle("Predicted Crimes (Red using Random Forest) vs Actual Crimes (Blue)") + labs(x = "Month", y = "Total Number of Crimes") 
+
+```
+
+Lastly, we can calculate an RMSE using the predictions captured by the Random Forest model to see if the RMSE is better. 
+
+```{r RMSE from Random Forest, echo = FALSE}
+
+#This creates y_hat as a column in the test_set
+test_set <- test_set %>% ungroup() %>% mutate(y_hat = prediction)
+
+
+#This will calculate the RMSE of the predictions generated by the Random Forest
+rmse_rf<- sqrt(mean((test_set$y_hat - test_set$total)^2))
+
+# Create a tibble with results
+rf_results <- tibble(Method = "Random Forest", RMSE = rmse_rf)
+rf_results
+
+```
+Surprisingly, we find that using the Random Forest did not improve the RMSE we calculated prior. I suspect this is due to the fact that our compiled data set was built upon time series data. 
+
+# **Conclusion**
+
+In conclusion, the final RMSE calculated in our modeling is 55.98. I can take these findings to the hypothetical mayor ane explain that based on the month, district, type of crime, and average temperature, our average standard deviation is around 56 reported crimes compared to actuals. While not perfect, it's clearly better than guessing our simply using the average as a predictor. 
+
+With this knowledge, the hypothetical mayor can use this prediction to appropriately deploy resources, for example, more police officers during months in which our model predicts more crimes will be reported. Politically, the mayor may use this to set expectations with his/her constituents and use it as political capital if they are able to report a lower actual than the prediction.
+
+While I touched on temperature as a factor in the model, other meteorological factors could be considered in future iterations, such as considering days with heavy snow or rain and seeing how this impacts the amount of crime in the city. Non meteorological factors could also be in play such as holidays or other large events the city of Chicago hosts. 
+
+An interesting aspect for future work would be to apply this model to other major cities to predict their crime levels. New York and Los Angeles would be candidates as well as major international cities such as Paris or Madrid.
+
+# **References**
+
+Chicago Crimes Kaggle Data set: <https://www.kaggle.com/datasets/utkarshx27/crimes-2001-to-present>
+
+Chicago Weather Kaggle Data set: <https://www.kaggle.com/datasets/curiel/chicago-weather-database>
+
+<https://crimesciencejournal.biomedcentral.com/articles/10.1186/s40163-022-00179-8>
